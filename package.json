@@ -1,0 +1,45 @@
+{
+  "name": "pi-browser-use",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./sdk/index.ts"
+  },
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "scripts": {
+    "daemon": "node daemon.ts",
+    "check": "tsc --noEmit && node --check chrome/background.js && node --check chrome/options.js",
+    "test": "node --test tests/*.test.ts"
+  },
+  "dependencies": {
+    "@mediabunny/server": "^1.51.0",
+    "fast-png": "^8.0.0",
+    "mediabunny": "^1.51.0",
+    "ws": "^8.18.3"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "packageManager": "pnpm@10.20.0"
+}

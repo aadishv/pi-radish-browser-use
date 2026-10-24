@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "pi browser use",
+  "description": "Lets pi drive this browser through the local browser-use daemon.",
+  "version": "0.1.0",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "alarms",
+    "debugger",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "pi browser use bridge"
+  },
+  "options_page": "options.html",
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'none'; connect-src ws://127.0.0.1:* ws://localhost:*"
+  }
+}
