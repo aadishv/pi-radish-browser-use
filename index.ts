@@ -5,52 +5,13 @@ import { Type } from "typebox";
 import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { PACKAGE_DIR, ensureDaemon } from "./daemon.ts";
+import { PACKAGE_DIR } from "./daemon.ts";
 import { runScript } from "./run.ts";
 
 const SKILL_PATH = join(PACKAGE_DIR, "skills", "browser-use", "SKILL.md");
 const SKILL_COMMANDS = ["/skill:browser-use", "$browser-use"];
 const CALL_PREVIEW_LINES = 10;
 const TOOL_NAME = "execute_browser_code";
-
-/** Keeps this pi session open in the daemon, so its headless browser survives between scripts. */
-class SessionHold {
-  readonly #sessionId: string;
-  #ws?: WebSocket;
-  #connecting?: Promise<void>;
-
-  constructor(sessionId: string) {
-    this.#sessionId = sessionId;
-  }
-
-  connect(): Promise<void> {
-    if (this.#ws?.readyState === WebSocket.OPEN) return Promise.resolve();
-    this.#connecting ??= this.#open().finally(() => (this.#connecting = undefined));
-    return this.#connecting;
-  }
-
-  /** `end` closes the session's browser now instead of after the daemon's grace period. */
-  close(end: boolean): void {
-    if (end && this.#ws?.readyState === WebSocket.OPEN) this.#ws.send(JSON.stringify({ type: "end" }));
-    this.#ws?.close();
-    this.#ws = undefined;
-  }
-
-  async #open(): Promise<void> {
-    const { token, port } = await ensureDaemon();
-    const ws = new WebSocket(`ws://127.0.0.1:${port}`);
-    await new Promise<void>((resolvePromise, rejectPromise) => {
-      ws.addEventListener("open", () => ws.send(JSON.stringify({ type: "hello", role: "pi", token, session: this.#sessionId })), { once: true });
-      ws.addEventListener("close", () => rejectPromise(new Error("Could not connect to the browser daemon")), { once: true });
-      ws.addEventListener("message", (event) => {
-        const hello = JSON.parse(String(event.data));
-        if (hello.ok) resolvePromise();
-        else rejectPromise(new Error(`Browser daemon rejected the connection: ${hello.error}`));
-      }, { once: true });
-    });
-    this.#ws = ws;
-  }
-}
 
 function formatResult(output: string): string {
   const truncation = truncateHead(output, { maxBytes: DEFAULT_MAX_BYTES, maxLines: DEFAULT_MAX_LINES });
@@ -74,17 +35,7 @@ function isSkillRead(input: unknown, cwd: string): boolean {
   return realpath(resolve(cwd, expanded)) === realpath(SKILL_PATH);
 }
 
-function toolResultText(result: { content?: unknown }): string {
-  if (!Array.isArray(result.content)) return "";
-  return result.content
-    .filter((item): item is { type: "text"; text: string } => item?.type === "text" && typeof item.text === "string")
-    .map((item) => item.text)
-    .join("\n");
-}
-
 export default function browserUseExtension(pi: ExtensionAPI) {
-  let hold: SessionHold | undefined;
-
   // Deferred tools stay undeclared until activated. Pi records the active set in the session, so
   // resumed sessions get the tool back on their own.
   pi.registerTool({
@@ -102,14 +53,10 @@ export default function browserUseExtension(pi: ExtensionAPI) {
       timeout: Type.Number({ minimum: 0.1, maximum: 300, default: 10, description: "End-to-end timeout in seconds. Use 10 unless the action needs a different limit." }),
       code: Type.String({ description: "TypeScript module run with Node in the project's cwd, after `import { connectBrowser } from \"pi-browser-use\"`. Its stdout and stderr are the result." }),
     }),
-    async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const sessionId = ctx.sessionManager.getSessionId();
-      onUpdate?.({ content: [{ type: "text", text: params.intent }], details: {} });
-      hold ??= new SessionHold(sessionId);
-      await hold.connect();
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const output = await runScript(params.code, {
         cwd: ctx.cwd,
-        env: { BROWSER_USE_SESSION: sessionId },
+        env: { BROWSER_USE_SESSION: ctx.sessionManager.getSessionId() },
         timeoutMs: (params.timeout ?? 10) * 1_000,
         signal,
       }).catch((error: Error) => {
@@ -134,19 +81,6 @@ export default function browserUseExtension(pi: ExtensionAPI) {
       }
       return new Text(text, 0, 0);
     },
-    renderResult(result, { expanded }, theme) {
-      const output = toolResultText(result);
-      const lines = output.split("\n");
-      if (expanded || lines.length <= 10) return new Text(output, 0, 0);
-
-      const remaining = lines.length - 10;
-      const hint = keyHint("app.tools.expand", "to show all output");
-      return new Text(
-        `${lines.slice(0, 10).join("\n")}\n${theme.fg("dim", `… ${remaining} more line${remaining === 1 ? "" : "s"} (${hint})`)}`,
-        0,
-        0,
-      );
-    },
   });
 
   const isActive = () => pi.getActiveTools().includes(TOOL_NAME);
@@ -160,11 +94,7 @@ export default function browserUseExtension(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     // Scripts run through bash share this session's headless browser too.
     process.env.BROWSER_USE_SESSION = ctx.sessionManager.getSessionId();
-    if (!isActive()) return;
-    ctx.ui.setStatus("browser-use", "browser use enabled");
-    // Reconnect right away after a reload or resume, before the daemon's grace period closes the browser.
-    hold ??= new SessionHold(ctx.sessionManager.getSessionId());
-    hold.connect().catch(() => {});
+    if (isActive()) ctx.ui.setStatus("browser-use", "browser use enabled");
   });
 
   pi.on("input", async (event, ctx) => {
@@ -175,9 +105,7 @@ export default function browserUseExtension(pi: ExtensionAPI) {
     if (event.toolName === "read" && !event.isError && isSkillRead(event.input, ctx.cwd)) activate(ctx);
   });
 
-  pi.on("session_shutdown", async (event, ctx) => {
+  pi.on("session_shutdown", async (_event, ctx) => {
     ctx.ui.setStatus("browser-use", undefined);
-    hold?.close(event.reason !== "reload");
-    hold = undefined;
   });
 }

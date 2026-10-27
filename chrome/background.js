@@ -1,5 +1,5 @@
-const DEFAULT_BRIDGE_URL = "ws://127.0.0.1:32123";
-const PROTOCOL_VERSION = 1;
+// Also hardcoded in daemon.ts.
+const BRIDGE_URL = "ws://127.0.0.1:32123";
 const CDP_VERSION = "1.3";
 const RECONNECT_ALARM = "browser-use-reconnect";
 const KEEPALIVE_MS = 20_000;
@@ -8,20 +8,11 @@ let socket = null;
 let reconnectTimer = null;
 let keepaliveTimer = null;
 let connecting = false;
-const sessions = new Map(); // sessionId -> { targetId, tabId? }
+const sessions = new Map(); // sessionId -> targetId
 const sessionByTarget = new Map();
-const sessionByTab = new Map();
 
 function send(message) {
   if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
-}
-
-async function readSettings() {
-  const stored = await chrome.storage.local.get(["bridgeUrl", "bridgeToken"]);
-  return {
-    bridgeUrl: typeof stored.bridgeUrl === "string" && stored.bridgeUrl ? stored.bridgeUrl : DEFAULT_BRIDGE_URL,
-    bridgeToken: typeof stored.bridgeToken === "string" ? stored.bridgeToken : "",
-  };
 }
 
 function setBadge(state) {
@@ -44,18 +35,18 @@ function clearTimers() {
   keepaliveTimer = null;
 }
 
-function scheduleReconnect(delayMs = 1_000) {
+function scheduleReconnect() {
   if (reconnectTimer !== null || connecting || socket?.readyState === WebSocket.OPEN) return;
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     connect().catch(() => {});
-  }, delayMs);
+  }, 1_000);
 }
 
-async function connect({ immediate = false } = {}) {
+async function connect() {
   if (connecting || socket?.readyState === WebSocket.OPEN || socket?.readyState === WebSocket.CONNECTING) return;
   connecting = true;
-  const { bridgeUrl, bridgeToken } = await readSettings();
+  const { bridgeToken } = await chrome.storage.local.get("bridgeToken");
   if (!bridgeToken) {
     connecting = false;
     setBadge("error");
@@ -63,11 +54,11 @@ async function connect({ immediate = false } = {}) {
   }
 
   try {
-    const nextSocket = new WebSocket(bridgeUrl);
+    const nextSocket = new WebSocket(BRIDGE_URL);
     socket = nextSocket;
     nextSocket.addEventListener("open", () => {
       connecting = false;
-      send({ type: "hello", role: "extension", token: bridgeToken, protocolVersion: PROTOCOL_VERSION });
+      send({ type: "hello", role: "extension", token: bridgeToken });
     });
     nextSocket.addEventListener("message", (event) => {
       handleMessage(String(event.data)).catch((error) => {
@@ -81,14 +72,14 @@ async function connect({ immediate = false } = {}) {
       clearTimers();
       setBadge("disconnected");
       detachAll().catch(() => {});
-      scheduleReconnect(immediate ? 250 : 1_000);
+      scheduleReconnect();
     });
     nextSocket.addEventListener("error", () => {
       if (socket === nextSocket) setBadge("disconnected");
     });
   } catch {
     connecting = false;
-    scheduleReconnect(immediate ? 250 : 1_000);
+    scheduleReconnect();
   }
 }
 
@@ -101,7 +92,7 @@ async function reconnect() {
   }
   connecting = false;
   await detachAll();
-  await connect({ immediate: true });
+  await connect();
 }
 
 async function handleMessage(raw) {
@@ -124,6 +115,7 @@ async function handleMessage(raw) {
     return;
   }
   if (message?.type === "keepalive") return;
+  if (message?.type === "release") return detachAll();
   if (!Number.isInteger(message?.id) || typeof message?.method !== "string") return;
 
   try {
@@ -143,27 +135,14 @@ async function handleMessage(raw) {
 
 async function dispatchCdp(method, params, sessionId) {
   if (sessionId) {
-    const session = sessions.get(sessionId);
-    if (!session) throw new Error(`Unknown CDP session ${sessionId}`);
-    return chrome.debugger.sendCommand({ targetId: session.targetId }, method, params);
+    const targetId = sessions.get(sessionId);
+    if (!targetId) throw new Error(`Unknown CDP session ${sessionId}`);
+    return chrome.debugger.sendCommand({ targetId }, method, params);
   }
 
   switch (method) {
-    case "Browser.getVersion":
-      return {
-        protocolVersion: CDP_VERSION,
-        product: `Chrome/${navigator.userAgent.match(/Chrome\/([^ ]+)/)?.[1] ?? "unknown"}`,
-        revision: "@browser-use-extension",
-        userAgent: navigator.userAgent,
-        jsVersion: "unknown",
-      };
     case "Target.getTargets":
       return { targetInfos: (await chrome.debugger.getTargets()).map(targetInfo) };
-    case "Target.getTargetInfo": {
-      const target = (await chrome.debugger.getTargets()).find((candidate) => candidate.id === params.targetId);
-      if (!target) throw new Error(`Unknown target ${params.targetId}`);
-      return { targetInfo: targetInfo(target) };
-    }
     case "Target.createTarget": {
       const tab = await chrome.tabs.create({ active: false, url: typeof params.url === "string" ? params.url : "about:blank" });
       if (tab.id === undefined) throw new Error("Chrome created a tab without an id");
@@ -181,13 +160,6 @@ async function dispatchCdp(method, params, sessionId) {
       await chrome.tabs.remove(target.tabId);
       return { success: true };
     }
-    case "Target.activateTarget": {
-      const target = (await chrome.debugger.getTargets()).find((candidate) => candidate.id === params.targetId);
-      if (!target?.tabId) throw new Error(`Target ${params.targetId} is not a tab`);
-      const tab = await chrome.tabs.update(target.tabId, { active: true });
-      if (tab.windowId !== undefined) await chrome.windows.update(tab.windowId, { focused: true });
-      return {};
-    }
     default:
       throw new Error(`${method} requires a target sessionId or is not supported by the extension bridge`);
   }
@@ -200,7 +172,6 @@ function targetInfo(target) {
     title: target.title,
     url: target.url,
     attached: target.attached,
-    canAccessOpener: false,
   };
 }
 
@@ -218,62 +189,46 @@ async function attachTarget(targetId) {
   if (typeof targetId !== "string") throw new Error("Target.attachToTarget requires targetId");
   const existing = sessionByTarget.get(targetId);
   if (existing) return { sessionId: existing };
-  const target = (await chrome.debugger.getTargets()).find((candidate) => candidate.id === targetId);
-  if (!target) throw new Error(`Unknown target ${targetId}`);
+  if (!(await chrome.debugger.getTargets()).some((candidate) => candidate.id === targetId)) throw new Error(`Unknown target ${targetId}`);
   await chrome.debugger.attach({ targetId }, CDP_VERSION);
   const sessionId = crypto.randomUUID();
-  const session = { targetId, ...(target.tabId === undefined ? {} : { tabId: target.tabId }) };
-  sessions.set(sessionId, session);
+  sessions.set(sessionId, targetId);
   sessionByTarget.set(targetId, sessionId);
-  if (target.tabId !== undefined) sessionByTab.set(target.tabId, sessionId);
   return { sessionId };
 }
 
 async function detachSession(sessionId) {
   if (typeof sessionId !== "string") throw new Error("Target.detachFromTarget requires sessionId");
-  const session = sessions.get(sessionId);
-  if (!session) return;
-  removeSession(sessionId, session);
+  const targetId = sessions.get(sessionId);
+  if (!targetId) return;
+  sessions.delete(sessionId);
+  sessionByTarget.delete(targetId);
   try {
-    await chrome.debugger.detach({ targetId: session.targetId });
+    await chrome.debugger.detach({ targetId });
   } catch {
     // Already detached or target closed.
   }
 }
 
-function removeSession(sessionId, session) {
-  sessions.delete(sessionId);
-  sessionByTarget.delete(session.targetId);
-  if (session.tabId !== undefined) sessionByTab.delete(session.tabId);
-}
-
 async function detachAll() {
-  const active = [...sessions.entries()];
+  const targetIds = [...sessions.values()];
   sessions.clear();
   sessionByTarget.clear();
-  sessionByTab.clear();
-  await Promise.allSettled(active.map(([, session]) => chrome.debugger.detach({ targetId: session.targetId })));
+  await Promise.allSettled(targetIds.map((targetId) => chrome.debugger.detach({ targetId })));
 }
 
+// Events come back with the debuggee passed to attach, which is always { targetId }.
 chrome.debugger.onEvent.addListener((source, method, params) => {
-  const sessionId =
-    (source.targetId ? sessionByTarget.get(source.targetId) : undefined) ??
-    (source.tabId !== undefined ? sessionByTab.get(source.tabId) : undefined);
-  if (!sessionId) return;
-  send({ method, params: params ?? {}, sessionId });
+  const sessionId = sessionByTarget.get(source.targetId);
+  if (sessionId) send({ method, params: params ?? {}, sessionId });
 });
 
 chrome.debugger.onDetach.addListener((source, reason) => {
-  const sessionId =
-    (source.targetId ? sessionByTarget.get(source.targetId) : undefined) ??
-    (source.tabId !== undefined ? sessionByTab.get(source.tabId) : undefined);
+  const sessionId = sessionByTarget.get(source.targetId);
   if (!sessionId) return;
-  const session = sessions.get(sessionId);
-  if (session) removeSession(sessionId, session);
-  send({
-    method: "Target.detachedFromTarget",
-    params: { sessionId, targetId: session?.targetId, reason },
-  });
+  sessions.delete(sessionId);
+  sessionByTarget.delete(source.targetId);
+  send({ method: "Target.detachedFromTarget", params: { sessionId, targetId: source.targetId, reason } });
 });
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -282,29 +237,22 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
   if (message?.type === "status") {
-    sendResponse({ connected: socket?.readyState === WebSocket.OPEN, sessions: sessions.size });
+    sendResponse({ connected: socket?.readyState === WebSocket.OPEN });
   }
   return false;
 });
 
 chrome.action.onClicked.addListener(() => {
   if (socket?.readyState === WebSocket.OPEN) chrome.runtime.openOptionsPage();
-  else connect({ immediate: true }).catch(() => {});
+  else connect().catch(() => {});
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === RECONNECT_ALARM && socket?.readyState !== WebSocket.OPEN) connect().catch(() => {});
 });
 
-chrome.runtime.onInstalled.addListener(() => {
-  chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: 0.5 });
-  connect({ immediate: true }).catch(() => {});
-});
-
-chrome.runtime.onStartup.addListener(() => {
-  chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: 0.5 });
-  connect({ immediate: true }).catch(() => {});
-});
+// Only here to wake the worker when Chrome starts; the top-level code below does the work.
+chrome.runtime.onStartup.addListener(() => {});
 
 chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: 0.5 });
-connect({ immediate: true }).catch(() => {});
+connect().catch(() => {});

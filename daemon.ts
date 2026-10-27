@@ -1,6 +1,6 @@
-import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { spawn, type ChildProcess } from "node:child_process";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -8,32 +8,25 @@ import { fileURLToPath } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
 
 export const PACKAGE_DIR = dirname(fileURLToPath(import.meta.url));
-export const DAEMON_PATH = fileURLToPath(import.meta.url);
-export const RUNTIME_DIR = join(PACKAGE_DIR, ".runtime");
-export const LOG_PATH = join(RUNTIME_DIR, "daemon.log");
+const DAEMON_PATH = fileURLToPath(import.meta.url);
+const RUNTIME_DIR = join(PACKAGE_DIR, ".runtime");
+const LOG_PATH = join(RUNTIME_DIR, "daemon.log");
 const CONFIG_PATH = join(PACKAGE_DIR, ".bridge.json");
-const EXECUTABLE_PATH = join(RUNTIME_DIR, "browser-executable");
 const PROFILE_PREFIX = "browser-use-profile-";
-const SESSION_GRACE_MS = 60_000;
+const SESSION_GRACE_MS = 30 * 60_000;
 const HOST = "127.0.0.1";
-const DEFAULT_PORT = 32123;
-const MAX_PAYLOAD = 64 * 1024 * 1024;
+// Also hardcoded in chrome/background.js.
+const PORT = 32123;
+export const DAEMON_URL = `ws://${HOST}:${PORT}`;
 const KNOWN_BROWSERS = process.platform === "darwin"
-  ? ["Helium", "Google Chrome", "Chromium", "Brave Browser", "Microsoft Edge"].map((name) => `/Applications/${name}.app/Contents/MacOS/${name}`)
+  ? ["/Applications/Helium.app/Contents/MacOS/Helium"]
   : ["/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/brave-browser", "/usr/bin/microsoft-edge"];
 
-export interface Config {
-  token: string;
-  port: number;
-}
-
-export function readConfig(): Config {
+function readToken(): string {
   if (!existsSync(CONFIG_PATH)) {
-    writeFileSync(CONFIG_PATH, `${JSON.stringify({ token: randomBytes(32).toString("base64url"), port: DEFAULT_PORT }, null, 2)}\n`, { mode: 0o600 });
+    writeFileSync(CONFIG_PATH, `${JSON.stringify({ token: randomBytes(32).toString("base64url") }, null, 2)}\n`, { mode: 0o600 });
   }
-  const { token, port = DEFAULT_PORT } = JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
-  if (typeof token !== "string" || token.length < 32) throw new Error(`${CONFIG_PATH} must contain a token of at least 32 characters`);
-  return { token, port };
+  return JSON.parse(readFileSync(CONFIG_PATH, "utf8")).token;
 }
 
 /** Changes whenever the daemon's code does, so a stale daemon gets restarted. */
@@ -41,9 +34,9 @@ function daemonVersion(): string {
   return createHash("sha256").update(readFileSync(DAEMON_PATH)).digest("hex").slice(0, 12);
 }
 
-export async function daemonStatus(port: number): Promise<{ pid: number; version: string; extensionConnected: boolean } | null> {
+async function daemonStatus(): Promise<{ pid: number; version: string; extensionConnected: boolean } | null> {
   try {
-    const response = await fetch(`http://${HOST}:${port}/status`, { signal: AbortSignal.timeout(1_000) });
+    const response = await fetch(`http://${HOST}:${PORT}/status`, { signal: AbortSignal.timeout(1_000) });
     return response.ok ? await response.json() : null;
   } catch {
     return null;
@@ -58,33 +51,28 @@ async function waitUntil(check: () => Promise<boolean>, error: string): Promise<
   throw new Error(error);
 }
 
-/** Starts the daemon, replacing one that runs older code, and returns how to reach it. */
-export async function ensureDaemon(): Promise<Config> {
-  const config = readConfig();
+/** Starts the daemon, replacing one that runs older code, and returns the token to connect with. */
+export async function ensureDaemon(): Promise<string> {
+  const token = readToken();
   const version = daemonVersion();
-  const status = await daemonStatus(config.port);
-  if (status?.version === version) return config;
+  const status = await daemonStatus();
+  if (status?.version === version) return token;
   if (status) {
     try {
       process.kill(status.pid, "SIGTERM");
     } catch {}
-    await waitUntil(async () => !(await daemonStatus(config.port)), `Old browser daemon (pid ${status.pid}) did not stop`);
+    await waitUntil(async () => !(await daemonStatus()), `Old browser daemon (pid ${status.pid}) did not stop`);
   }
-  mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 });
+  mkdirSync(RUNTIME_DIR, { recursive: true });
   let size = 0;
   try {
     size = statSync(LOG_PATH).size;
   } catch {}
-  const log = openSync(LOG_PATH, size > 1_000_000 ? "w" : "a", 0o600);
+  const log = openSync(LOG_PATH, size > 1_000_000 ? "w" : "a");
   spawn(process.execPath, [DAEMON_PATH, "serve"], { detached: true, stdio: ["ignore", log, log] }).unref();
   closeSync(log);
-  await waitUntil(async () => (await daemonStatus(config.port))?.version === version, `Browser daemon did not start. See ${LOG_PATH}`);
-  return config;
-}
-
-function safeTokenEquals(left: unknown, right: string): boolean {
-  if (typeof left !== "string") return false;
-  return timingSafeEqual(createHash("sha256").update(left).digest(), createHash("sha256").update(right).digest());
+  await waitUntil(async () => (await daemonStatus())?.version === version, `Browser daemon did not start. See ${LOG_PATH}`);
+  return token;
 }
 
 function send(socket: WebSocket | null | undefined, message: unknown): void {
@@ -108,33 +96,9 @@ interface Headless {
 }
 
 function browserExecutable(): string {
-  const detected = existsSync(EXECUTABLE_PATH) ? readFileSync(EXECUTABLE_PATH, "utf8").trim() : undefined;
-  const found = [process.env.BROWSER_EXECUTABLE, detected, ...KNOWN_BROWSERS].find((path) => path && existsSync(path));
+  const found = [process.env.BROWSER_EXECUTABLE, ...KNOWN_BROWSERS].find((path) => path && existsSync(path));
   if (!found) throw new Error("No Chromium-based browser found. Set BROWSER_EXECUTABLE in the daemon's environment.");
   return found;
-}
-
-/** Records the binary of the browser the extension runs in, so headless sessions use the same one. */
-function detectExtensionBrowser(peerPort: number | undefined): void {
-  if (!peerPort || process.platform === "win32") return;
-  try {
-    const ps = (pid: number, field: string) => execFileSync("ps", ["-o", `${field}=`, "-p", String(pid)], { encoding: "utf8" }).trim();
-    const peer = execFileSync("lsof", ["-nP", `-iTCP:${peerPort}`, "-sTCP:ESTABLISHED", "-Fp"], { encoding: "utf8" })
-      .split("\n")
-      .filter((line) => line.startsWith("p"))
-      .map((line) => Number(line.slice(1)))
-      .find((pid) => pid !== process.pid);
-    // The socket usually belongs to a helper process (`--type=utility`); walk up to the browser itself.
-    for (let pid = peer ?? 0; pid > 1; pid = Number(ps(pid, "ppid"))) {
-      if (ps(pid, "args").includes("--type=")) continue;
-      const executable = process.platform === "linux" ? readlinkSync(`/proc/${pid}/exe`) : ps(pid, "comm");
-      writeFileSync(EXECUTABLE_PATH, executable);
-      log(`extension browser: ${executable}`);
-      return;
-    }
-  } catch (error) {
-    log(`could not detect the extension's browser: ${errorText(error)}`);
-  }
 }
 
 async function launchHeadless(onExit: () => void): Promise<Headless> {
@@ -181,12 +145,12 @@ function stopProcess(child: ChildProcess): void {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Sessions: each owns one headless browser, shared by a pi session and the scripts it runs
+// Sessions: each owns one headless browser, shared by the scripts of one pi session
 
 interface Session {
   id: string;
   clients: Set<WebSocket>;
-  /** How long the browser outlives its last client, so named sessions survive between scripts and pi reloads. */
+  /** How long the browser outlives its last client, so a pi session's browser survives between scripts. */
   graceMs: number;
   headless?: Promise<Headless>;
   graceTimer?: ReturnType<typeof setTimeout>;
@@ -224,7 +188,7 @@ async function connectHeadless(session: Session): Promise<WebSocket> {
       if (session.headless === launch) session.headless = undefined;
     });
   }
-  const upstream = new WebSocket((await session.headless).wsUrl, { maxPayload: MAX_PAYLOAD });
+  const upstream = new WebSocket((await session.headless).wsUrl);
   await new Promise((resolve, reject) => {
     upstream.once("open", resolve);
     upstream.once("error", reject);
@@ -243,62 +207,24 @@ function closeSession(session: Session): void {
 // Server
 
 async function serve(): Promise<void> {
-  const config = readConfig();
+  const token = readToken();
   const version = daemonVersion();
   // Headless browsers die with the daemon that launched them, so any profile left behind is stale.
   for (const entry of readdirSync(tmpdir())) {
     if (entry.startsWith(PROFILE_PREFIX)) rmSync(join(tmpdir(), entry), { recursive: true, force: true });
   }
 
-  // The Chrome extension is shared by every script connected to the user's browser. Request IDs are
-  // rewritten so responses find their script, and each attached tab belongs to the script that attached it.
+  // The extension serves one script at a time. Request IDs are offset by that script's generation, so a
+  // late response to a script that already exited is dropped instead of reaching its successor.
   let extension: WebSocket | null = null;
-  const sdkClients = new Set<WebSocket>();
-  const inflight = new Map<number, { client: WebSocket; id: number; method: string }>();
-  const tabOwners = new Map<string, WebSocket>();
-  let nextId = 0;
+  let user: WebSocket | null = null;
+  let generation = 0;
+  const ID_SPACE = 2 ** 32;
 
-  const releaseTabs = (client: WebSocket) => {
-    for (const [sessionId, owner] of tabOwners) {
-      if (owner !== client) continue;
-      tabOwners.delete(sessionId);
-      send(extension, { id: ++nextId, method: "Target.detachFromTarget", params: { sessionId } });
-    }
-    for (const [id, entry] of inflight) if (entry.client === client) inflight.delete(id);
-  };
-
-  const fromExtension = (raw: string, message: any) => {
+  const fromExtension = (message: any) => {
     if (message?.type === "keepalive") return send(extension, { type: "keepalive", ok: true });
-    if (Number.isInteger(message?.id)) {
-      const request = inflight.get(message.id);
-      if (!request) return;
-      inflight.delete(message.id);
-      const tab = message.result?.sessionId;
-      if (request.method === "Target.attachToTarget" && typeof tab === "string") {
-        const owner = tabOwners.get(tab);
-        if (owner && owner !== request.client && owner.readyState === WebSocket.OPEN) {
-          return send(request.client, { id: request.id, error: { message: "That tab is controlled by another script" } });
-        }
-        tabOwners.set(tab, request.client);
-      }
-      return send(request.client, { ...message, id: request.id });
-    }
-    const tab = message?.sessionId ?? message?.params?.sessionId;
-    const owner = typeof tab === "string" ? tabOwners.get(tab) : undefined;
-    if (message?.method === "Target.detachedFromTarget") tabOwners.delete(tab);
-    send(owner, raw);
-  };
-
-  const fromSdk = (client: WebSocket, message: any) => {
-    if (!Number.isInteger(message?.id) || typeof message?.method !== "string") return;
-    if (extension?.readyState !== WebSocket.OPEN) {
-      return send(client, { id: message.id, error: { message: "The browser-use Chrome extension is not connected" } });
-    }
-    const owner = message.sessionId ? tabOwners.get(message.sessionId) : undefined;
-    if (owner && owner !== client) return send(client, { id: message.id, error: { message: "That tab is controlled by another script" } });
-    const id = ++nextId;
-    inflight.set(id, { client, id: message.id, method: message.method });
-    send(extension, { ...message, id });
+    if (!Number.isInteger(message?.id)) return send(user, message);
+    if (Math.floor(message.id / ID_SPACE) === generation) send(user, { ...message, id: message.id % ID_SPACE });
   };
 
   const httpServer = createServer((request, response) => {
@@ -312,27 +238,19 @@ async function serve(): Promise<void> {
       uptimeSeconds: Math.round(process.uptime()),
     }));
   });
-  const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_PAYLOAD });
-
-  httpServer.on("upgrade", (request, socket, head) => {
-    if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(request.socket.remoteAddress ?? "")) return void socket.destroy();
-    wss.handleUpgrade(request, socket, head, (webSocket) => wss.emit("connection", webSocket, request));
-  });
+  const wss = new WebSocketServer({ server: httpServer });
 
   wss.on("connection", (socket: WebSocket, request) => {
     const origin = request.headers.origin;
-    // "user" and "isolated" are SDK connections; "pi" only holds a session open between scripts.
-    let role: "extension" | "user" | "isolated" | "pi" | undefined;
+    let role: "extension" | "user" | "isolated" | undefined;
     let session: Session | undefined;
     let upstream: WebSocket | undefined;
-    const helloTimer = setTimeout(() => socket.close(1008, "hello timeout"), 3_000);
     const reject = (error: string) => {
       send(socket, { type: "hello", ok: false, error });
       socket.close(1008, error);
     };
 
-    socket.on("message", async (data, isBinary) => {
-      if (isBinary) return void socket.close(1003, "text messages only");
+    socket.on("message", async (data) => {
       let message: any;
       try {
         message = JSON.parse(String(data));
@@ -340,28 +258,32 @@ async function serve(): Promise<void> {
         return void socket.close(1007, "invalid JSON");
       }
 
-      if (role === "extension") return fromExtension(String(data), message);
-      if (role === "user") return fromSdk(socket, message);
+      if (role === "extension") return fromExtension(message);
+      if (role === "user") return send(extension, { ...message, id: generation * ID_SPACE + message.id });
       if (role === "isolated") return send(upstream, String(data));
-      if (role === "pi") return message?.type === "end" ? closeSession(session!) : undefined;
 
-      if (message?.type !== "hello" || !safeTokenEquals(message.token, config.token)) return reject("Invalid hello");
+      if (message?.type !== "hello" || message.token !== token) return reject("Invalid hello");
       // Only the Chrome extension may connect from a browser, so web pages can never reach the daemon.
       if (message.role === "extension" ? !origin?.startsWith("chrome-extension://") : origin !== undefined) {
         return reject("Unexpected origin");
       }
-      clearTimeout(helloTimer);
       if (message.role === "extension") {
         role = "extension";
         extension?.close(1012, "replaced by a new extension connection");
         extension = socket;
-        send(socket, { type: "hello", ok: true, protocolVersion: 1 });
-        for (const client of sdkClients) send(client, { type: "status", extensionConnected: true });
-        detectExtensionBrowser(request.socket.remotePort);
+        send(socket, { type: "hello", ok: true });
       } else if (message.role === "sdk" && message.browser === "user") {
+        // A freshly restarted daemon needs a moment for the extension to reconnect.
+        try {
+          await waitUntil(async () => extension?.readyState === WebSocket.OPEN, "");
+        } catch {
+          return reject("The user's browser is unreachable: the browser-use Chrome extension is not connected. Ask the user to click its toolbar icon, or to pair it if it was never set up.");
+        }
+        if (user) return reject("Another script is using the user's browser. Try again once it exits.");
         role = "user";
-        sdkClients.add(socket);
-        send(socket, { type: "hello", ok: true, protocolVersion: 1, extensionConnected: extension?.readyState === WebSocket.OPEN });
+        user = socket;
+        generation += 1;
+        send(socket, { type: "hello", ok: true });
       } else if (message.role === "sdk" && message.browser === "isolated") {
         // Relay the script's CDP traffic to its session's headless browser.
         role = "isolated";
@@ -374,10 +296,6 @@ async function serve(): Promise<void> {
         if (socket.readyState !== WebSocket.OPEN) return void upstream.close();
         upstream.on("message", (upstreamData) => send(socket, String(upstreamData)));
         upstream.on("close", () => socket.close(1011, "The headless browser closed"));
-        send(socket, { type: "hello", ok: true, protocolVersion: 1 });
-      } else if (message.role === "pi" && typeof message.session === "string") {
-        role = "pi";
-        session = joinSession(message.session, socket);
         send(socket, { type: "hello", ok: true });
       } else {
         reject("Invalid hello");
@@ -385,17 +303,14 @@ async function serve(): Promise<void> {
     });
 
     socket.on("close", () => {
-      clearTimeout(helloTimer);
       if (socket === extension) {
         extension = null;
-        tabOwners.clear();
-        for (const [id, entry] of inflight) send(entry.client, { id: entry.id, error: { message: "The Chrome extension disconnected" } });
-        inflight.clear();
-        for (const client of sdkClients) send(client, { type: "status", extensionConnected: false });
+        user?.close(1011, "The Chrome extension disconnected");
       }
-      if (role === "user") {
-        sdkClients.delete(socket);
-        releaseTabs(socket);
+      if (socket === user) {
+        user = null;
+        // Detaches the script's tabs, which also removes Chrome's "started debugging" bar.
+        send(extension, { type: "release" });
       }
       upstream?.close();
       if (session) leaveSession(session, socket);
@@ -404,9 +319,9 @@ async function serve(): Promise<void> {
 
   await new Promise<void>((resolve, reject) => {
     httpServer.once("error", reject);
-    httpServer.listen(config.port, HOST, resolve);
+    httpServer.listen(PORT, HOST, resolve);
   });
-  log(`daemon pid=${process.pid} version=${version} listening on ws://${HOST}:${config.port}`);
+  log(`daemon pid=${process.pid} version=${version} listening on ${DAEMON_URL}`);
 
   const shutdown = () => {
     for (const session of sessions.values()) closeSession(session);
@@ -419,15 +334,12 @@ async function serve(): Promise<void> {
 }
 
 async function main(command: string): Promise<void> {
-  process.umask(0o077);
-  mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 });
+  mkdirSync(RUNTIME_DIR, { recursive: true });
   if (command === "serve") return serve();
-  const config = readConfig();
-  const status = await daemonStatus(config.port);
+  const status = await daemonStatus();
   if (command === "setup") {
-    console.log(`Load ${join(PACKAGE_DIR, "chrome")} as an unpacked extension, open its options, and paste:`);
-    console.log(`  Bridge URL:    ws://${HOST}:${config.port}`);
-    console.log(`  Pairing token: ${config.token}`);
+    console.log(`Load ${join(PACKAGE_DIR, "chrome")} as an unpacked extension, open its options, and paste this pairing token:`);
+    console.log(`  ${readToken()}`);
   } else if (command === "status") {
     console.log(status ? JSON.stringify(status, null, 2) : "Daemon is not running");
   } else if (command === "stop") {

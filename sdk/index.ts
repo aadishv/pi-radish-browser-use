@@ -1,21 +1,18 @@
+import { randomUUID } from "node:crypto";
 import { writeFile } from "node:fs/promises";
-import { ensureDaemon } from "../daemon.ts";
-import type { ScreencastOptions, ScreencastResult } from "./screencast-types.ts";
-
-export { ScreencastError, type ScreencastOptions, type ScreencastResult } from "./screencast-types.ts";
+import { DAEMON_URL, ensureDaemon } from "../daemon.ts";
 
 const DEFAULT_TIMEOUT = 15_000;
 const DEFAULT_NAVIGATION_TIMEOUT = 30_000;
+const ACTION_TIMEOUT = 5_000;
 
-type CdpId = number;
 type JsonObject = Record<string, unknown>;
 type MessageListener = (params: JsonObject, message: CdpEvent) => void;
 
 interface CdpResponse {
-  id: CdpId;
+  id: number;
   result?: JsonObject;
-  error?: { code?: number; message?: string; data?: unknown };
-  sessionId?: string;
+  error?: { code?: number; message?: string };
 }
 
 interface CdpEvent {
@@ -24,29 +21,12 @@ interface CdpEvent {
   sessionId?: string;
 }
 
-interface BridgeHello {
-  type: "hello";
-  role: "sdk";
-  token: string;
-  protocolVersion: 1;
-  browser: "isolated" | "user";
-  session?: string;
-}
-
-interface BridgeControl {
-  type: "hello" | "status" | "keepalive";
-  ok?: boolean;
-  error?: string;
-  extensionConnected?: boolean;
-}
-
 export interface TargetInfo {
   targetId: string;
   type: string;
   title: string;
   url: string;
   attached?: boolean;
-  browserContextId?: string;
 }
 
 export interface ConnectBrowserOptions {
@@ -55,8 +35,7 @@ export interface ConnectBrowserOptions {
    * (pi sets it to the session id), or this script's own if unset. user: the user's browser, through the extension.
    */
   browser?: "isolated" | "user";
-  /** Some other DevTools endpoint instead: a browser WebSocket URL, or an HTTP base URL exposing /json/version. */
-  cdpUrl?: string;
+  /** Per CDP command. */
   timeoutMs?: number;
 }
 
@@ -84,136 +63,42 @@ export interface WaitForLocatorOptions {
 }
 
 function sleep(ms: number): Promise<void> {
-  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
-}
-
-async function resolveCdpWebSocketUrl(url: string): Promise<string> {
-  if (url.startsWith("ws://") || url.startsWith("wss://")) return url;
-  const base = new URL(url);
-  if (base.protocol !== "http:" && base.protocol !== "https:") {
-    throw new Error(`Unsupported CDP URL protocol: ${base.protocol}`);
-  }
-  const endpoint = new URL("/json/version", base);
-  const response = await fetch(endpoint);
-  if (!response.ok) throw new Error(`CDP discovery failed: ${response.status} ${response.statusText}`);
-  const body = (await response.json()) as { webSocketDebuggerUrl?: unknown };
-  if (typeof body.webSocketDebuggerUrl !== "string") {
-    throw new Error(`CDP discovery response from ${endpoint} did not include webSocketDebuggerUrl`);
-  }
-  return body.webSocketDebuggerUrl;
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 class CdpConnection {
-  readonly backend: "extension" | "cdp";
-  readonly #url: string;
+  readonly #ws: WebSocket;
   readonly #timeoutMs: number;
-  readonly #hello?: BridgeHello;
-  #ws?: WebSocket;
   #nextId = 0;
-  #pending = new Map<number, {
+  readonly #pending = new Map<number, {
     method: string;
     timer: ReturnType<typeof setTimeout>;
     resolve: (result: JsonObject) => void;
     reject: (error: Error) => void;
   }>();
-  #listeners = new Map<string, Set<MessageListener>>();
-  #openPromise?: Promise<void>;
-  #helloResolve?: () => void;
-  #helloReject?: (error: Error) => void;
-  #extensionResolve?: () => void;
-  #extensionReady = false;
-  #closed = false;
+  readonly #listeners = new Map<string, Set<MessageListener>>();
 
-  constructor(url: string, backend: "extension" | "cdp", timeoutMs: number, hello?: BridgeHello) {
-    this.#url = url;
-    this.backend = backend;
+  constructor(ws: WebSocket, timeoutMs: number) {
+    this.#ws = ws;
     this.#timeoutMs = timeoutMs;
-    this.#hello = hello;
+    ws.addEventListener("message", (event) => this.#handleMessage(JSON.parse(String(event.data))));
+    ws.addEventListener("close", () => this.#rejectAll(new Error("The browser connection closed")));
   }
 
-  async connect(): Promise<void> {
-    if (this.#openPromise) return this.#openPromise;
-    this.#openPromise = new Promise<void>((resolvePromise, rejectPromise) => {
-      const ws = new WebSocket(this.#url);
-      this.#ws = ws;
-      let opened = false;
-      const timer = setTimeout(() => {
-        if (!opened) {
-          ws.close();
-          rejectPromise(new Error(`Timed out connecting to ${this.#url}`));
-        }
-      }, this.#timeoutMs);
-
-      ws.addEventListener("open", () => {
-        opened = true;
-        clearTimeout(timer);
-        if (!this.#hello) {
-          this.#extensionReady = true;
-          resolvePromise();
-          return;
-        }
-        const helloPromise = new Promise<void>((helloResolve, helloReject) => {
-          this.#helloResolve = helloResolve;
-          this.#helloReject = helloReject;
-        });
-        ws.send(JSON.stringify(this.#hello));
-        helloPromise.then(resolvePromise, rejectPromise);
-      });
-
-      ws.addEventListener("message", (event) => this.#handleMessage(String(event.data)));
-      ws.addEventListener("error", () => {
-        if (!opened) {
-          clearTimeout(timer);
-          rejectPromise(new Error(`Could not connect to ${this.#url}`));
-        }
-      });
-      ws.addEventListener("close", () => {
-        this.#closed = true;
-        this.#rejectAll(new Error(`CDP connection to ${this.#url} closed`));
-      });
-    });
-    return this.#openPromise;
+  get closed(): boolean {
+    return this.#ws.readyState !== WebSocket.OPEN;
   }
 
-  async waitForExtension(timeoutMs = this.#timeoutMs): Promise<void> {
-    if (this.backend !== "extension" || this.#extensionReady) return;
-    await new Promise<void>((resolvePromise, rejectPromise) => {
-      this.#extensionResolve = resolvePromise;
-      const timer = setTimeout(() => {
-        if (this.#extensionResolve === resolvePromise) this.#extensionResolve = undefined;
-        rejectPromise(
-          new Error(
-            "The user's browser is unreachable: the browser-use Chrome extension is not connected. Ask the user to click its toolbar icon, or to pair it if it was never set up.",
-          ),
-        );
-      }, timeoutMs);
-      const wrappedResolve = () => {
-        clearTimeout(timer);
-        resolvePromise();
-      };
-      this.#extensionResolve = wrappedResolve;
-    });
-  }
-
-  async send<T extends JsonObject = JsonObject>(method: string, params: JsonObject = {}, sessionId?: string): Promise<T> {
-    await this.connect();
-    await this.waitForExtension();
-    if (!this.#ws || this.#ws.readyState !== WebSocket.OPEN || this.#closed) {
-      throw new Error("CDP connection is not open");
-    }
+  send<T extends JsonObject = JsonObject>(method: string, params: JsonObject = {}, sessionId?: string): Promise<T> {
+    if (this.closed) return Promise.reject(new Error("The browser connection is closed"));
     const id = ++this.#nextId;
-    return new Promise<T>((resolvePromise, rejectPromise) => {
+    return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.#pending.delete(id);
-        rejectPromise(new Error(`Timed out waiting for CDP method ${method}`));
+        reject(new Error(`Timed out waiting for CDP method ${method}`));
       }, this.#timeoutMs);
-      this.#pending.set(id, {
-        method,
-        timer,
-        resolve: (result) => resolvePromise(result as T),
-        reject: rejectPromise,
-      });
-      this.#ws!.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
+      this.#pending.set(id, { method, timer, resolve: (result) => resolve(result as T), reject });
+      this.#ws.send(JSON.stringify({ id, method, params, sessionId }));
     });
   }
 
@@ -227,64 +112,12 @@ class CdpConnection {
     };
   }
 
-  waitForEvent(method: string, options: { sessionId?: string; timeoutMs?: number } = {}): Promise<JsonObject> {
-    const timeoutMs = options.timeoutMs ?? this.#timeoutMs;
-    return new Promise((resolvePromise, rejectPromise) => {
-      let off = () => {};
-      const timer = setTimeout(() => {
-        off();
-        rejectPromise(new Error(`Timed out waiting for CDP event ${method}`));
-      }, timeoutMs);
-      off = this.on(method, (params, message) => {
-        if (options.sessionId && message.sessionId !== options.sessionId) return;
-        clearTimeout(timer);
-        off();
-        resolvePromise(params);
-      });
-    });
-  }
-
-  get closed(): boolean {
-    return this.#closed;
-  }
-
   close(): void {
-    this.#closed = true;
-    this.#ws?.close();
-    this.#rejectAll(new Error("CDP connection closed"));
+    this.#ws.close();
+    this.#rejectAll(new Error("The browser connection closed"));
   }
 
-  #handleMessage(raw: string): void {
-    let message: CdpResponse | CdpEvent | BridgeControl;
-    try {
-      message = JSON.parse(raw) as CdpResponse | CdpEvent | BridgeControl;
-    } catch {
-      return;
-    }
-
-    if ("type" in message) {
-      if (message.type === "hello") {
-        if (message.ok === false) {
-          this.#helloReject?.(new Error(message.error ?? "Browser bridge rejected the SDK connection"));
-        } else {
-          this.#extensionReady = message.extensionConnected === true;
-          this.#helloResolve?.();
-          if (this.#extensionReady) this.#extensionResolve?.();
-        }
-        this.#helloResolve = undefined;
-        this.#helloReject = undefined;
-      } else if (message.type === "status") {
-        this.#extensionReady = message.extensionConnected === true;
-        if (this.#extensionReady) {
-          this.#extensionResolve?.();
-          this.#extensionResolve = undefined;
-        } else {
-          this.#rejectAll(new Error("Chrome extension disconnected from the browser bridge"));
-        }
-      }
-      return;
-    }
-
+  #handleMessage(message: CdpResponse | CdpEvent): void {
     if ("id" in message) {
       const pending = this.#pending.get(message.id);
       if (!pending) return;
@@ -298,12 +131,7 @@ class CdpConnection {
       }
       return;
     }
-
-    if ("method" in message) {
-      for (const listener of this.#listeners.get(message.method) ?? []) {
-        listener(message.params ?? {}, message);
-      }
-    }
+    for (const listener of this.#listeners.get(message.method) ?? []) listener(message.params ?? {}, message);
   }
 
   #rejectAll(error: Error): void {
@@ -316,13 +144,11 @@ class CdpConnection {
 }
 
 export class Browser {
-  readonly backend: "extension" | "cdp";
   readonly #connection: CdpConnection;
   readonly #sessions = new Map<string, string>();
 
   constructor(connection: CdpConnection) {
     this.#connection = connection;
-    this.backend = connection.backend;
   }
 
   get connected(): boolean {
@@ -337,11 +163,7 @@ export class Browser {
   async tabs(): Promise<TargetInfo[]> {
     const { targetInfos } = await this.send<{ targetInfos: TargetInfo[] }>("Target.getTargets");
     return targetInfos.filter(
-      (target) =>
-        typeof target.targetId === "string" &&
-        target.type === "page" &&
-        !target.url.startsWith("chrome://") &&
-        !target.url.startsWith("chrome-extension://"),
+      (target) => target.type === "page" && !target.url.startsWith("chrome://") && !target.url.startsWith("chrome-extension://"),
     );
   }
 
@@ -356,25 +178,17 @@ export class Browser {
     const matches = exact ? [exact] : tabs.filter((tab) => tab.targetId.startsWith(targetIdOrPrefix));
     if (matches.length === 0) throw new Error(`No page target matches ${targetIdOrPrefix}`);
     if (matches.length > 1) throw new Error(`Page target prefix ${targetIdOrPrefix} is ambiguous`);
-    const target = matches[0]!;
-    let sessionId = this.#sessions.get(target.targetId);
+    const { targetId } = matches[0]!;
+    let sessionId = this.#sessions.get(targetId);
     if (!sessionId) {
-      const attached = await this.send<{ sessionId: string }>("Target.attachToTarget", {
-        targetId: target.targetId,
-        flatten: true,
-      });
-      sessionId = attached.sessionId;
-      this.#sessions.set(target.targetId, sessionId);
+      ({ sessionId } = await this.send<{ sessionId: string }>("Target.attachToTarget", { targetId, flatten: true }));
+      this.#sessions.set(targetId, sessionId);
     }
-    return new Page(this.#connection, target.targetId, sessionId);
+    return new Page(this.#connection, targetId, sessionId);
   }
 
   async close(): Promise<void> {
-    await Promise.allSettled(
-      [...this.#sessions.values()].map((sessionId) =>
-        this.send("Target.detachFromTarget", { sessionId }),
-      ),
-    );
+    await Promise.allSettled([...this.#sessions.values()].map((sessionId) => this.send("Target.detachFromTarget", { sessionId })));
     this.#sessions.clear();
     this.#connection.close();
   }
@@ -384,7 +198,6 @@ export class Page {
   readonly targetId: string;
   readonly sessionId: string;
   readonly #connection: CdpConnection;
-  #screencasting = false;
 
   constructor(connection: CdpConnection, targetId: string, sessionId: string) {
     this.#connection = connection;
@@ -392,7 +205,7 @@ export class Page {
     this.sessionId = sessionId;
   }
 
-  /** Sends an exact target-session CDP command. */
+  /** Sends a CDP command to this tab. */
   send<T extends JsonObject = JsonObject>(method: string, params: JsonObject = {}): Promise<T> {
     return this.#connection.send<T>(method, params, this.sessionId);
   }
@@ -403,67 +216,32 @@ export class Page {
     });
   }
 
-  async screencast<T>(
-    action: () => T | Promise<T>,
-    options: ScreencastOptions = {},
-  ): Promise<ScreencastResult<T>> {
-    if (this.#screencasting) throw new Error("A screencast is already running on this page");
-    this.#screencasting = true;
-    try {
-      const { recordScreencast } = await import("./screencast.ts");
-      return await recordScreencast(this, action, options);
-    } finally {
-      this.#screencasting = false;
-    }
+  /** Records `action` to an MP4 under the system temp dir. */
+  async screencast<T>(action: () => T | Promise<T>, options: { everyNthFrame?: number } = {}): Promise<{ value: T; path: string }> {
+    // Imported lazily so scripts that never record don't load the video encoder.
+    const { recordScreencast } = await import("./screencast.ts");
+    return recordScreencast(this, action, options.everyNthFrame);
   }
 
   async goto(url: string, options: { timeoutMs?: number } = {}): Promise<void> {
-    const parsed = new URL(url);
-    if (!["http:", "https:", "file:"].includes(parsed.protocol)) {
-      throw new Error(`Unsupported navigation protocol: ${parsed.protocol}`);
-    }
-    await this.send("Page.enable");
-    const result = await this.send<{ errorText?: string }>("Page.navigate", { url });
-    if (result.errorText) throw new Error(result.errorText);
-    const deadline = Date.now() + (options.timeoutMs ?? DEFAULT_NAVIGATION_TIMEOUT);
-    while (Date.now() < deadline) {
-      try {
-        if ((await this.evaluate<string>("document.readyState")) === "complete") return;
-      } catch {
-        // Execution contexts are briefly unavailable during navigation.
-      }
-      await sleep(150);
-    }
-    throw new Error(`Timed out waiting for ${url} to finish loading`);
+    const { errorText } = await this.send<{ errorText?: string }>("Page.navigate", { url });
+    if (errorText) throw new Error(`${url}: ${errorText}`);
+    await poll(() => this.evaluate<boolean>(`document.readyState === "complete"`), options.timeoutMs ?? DEFAULT_NAVIGATION_TIMEOUT, `${url} to finish loading`);
   }
 
   async evaluate<T = unknown>(expression: string | ((...args: any[]) => unknown), ...args: unknown[]): Promise<T> {
-    const source =
-      typeof expression === "function"
-        // Transpilers such as esbuild/tsx may insert __name(...) calls into a
-        // function's source. Provide a harmless local shim when serializing it
-        // for execution in the page.
-        ? `(() => { const __name = (target) => target; return (${expression.toString()})(...${JSON.stringify(args)}); })()`
-        : expression;
-    await this.send("Runtime.enable");
+    const source = typeof expression === "function"
+      // tsx and esbuild may insert __name(...) calls into a function's source.
+      ? `(() => { const __name = (target) => target; return (${expression.toString()})(...${JSON.stringify(args)}); })()`
+      : expression;
     const response = await this.send<{
-      result: { value?: T; unserializableValue?: string; description?: string };
+      result: { value?: T; unserializableValue?: string };
       exceptionDetails?: { text?: string; exception?: { description?: string } };
-    }>("Runtime.evaluate", {
-      expression: source,
-      awaitPromise: true,
-      returnByValue: true,
-      userGesture: true,
-    });
+    }>("Runtime.evaluate", { expression: source, awaitPromise: true, returnByValue: true, userGesture: true });
     if (response.exceptionDetails) {
-      throw new Error(
-        response.exceptionDetails.exception?.description ?? response.exceptionDetails.text ?? "Browser evaluation failed",
-      );
+      throw new Error(response.exceptionDetails.exception?.description ?? response.exceptionDetails.text ?? "Browser evaluation failed");
     }
-    if (response.result.unserializableValue !== undefined) {
-      return response.result.unserializableValue as T;
-    }
-    return response.result.value as T;
+    return (response.result.unserializableValue ?? response.result.value) as T;
   }
 
   title(): Promise<string> {
@@ -474,11 +252,9 @@ export class Page {
     return this.evaluate<string>("location.href");
   }
 
-  async content(selector?: string): Promise<string> {
+  content(selector?: string): Promise<string> {
     return this.evaluate<string>(
-      selector
-        ? `document.querySelector(${JSON.stringify(selector)})?.outerHTML ?? ""`
-        : "document.documentElement.outerHTML",
+      selector ? `document.querySelector(${JSON.stringify(selector)})?.outerHTML ?? ""` : "document.documentElement.outerHTML",
     );
   }
 
@@ -490,19 +266,23 @@ export class Page {
   }
 
   locator(selector: string): Locator {
-    return new Locator(this, selector);
+    return this.#root().locator(selector);
   }
 
   getByRole(role: string, options: RoleLocatorOptions = {}): Locator {
-    return Locator.byRole(this, role, options);
+    return this.#root().getByRole(role, options);
   }
 
   getByText(text: string | RegExp, options: TextLocatorOptions = {}): Locator {
-    return Locator.byText(this, text, options);
+    return this.#root().getByText(text, options);
+  }
+
+  /** The document, which page-level locators search from. */
+  #root(): Locator {
+    return new Locator(this, "", (group) => evaluateHandle(this, "[document]", group));
   }
 
   async accessibilitySnapshot(options: SnapshotOptions = {}): Promise<string> {
-    await this.send("Accessibility.enable");
     const { nodes } = await this.send<{ nodes: Array<{
       nodeId: string;
       parentId?: string;
@@ -518,10 +298,7 @@ export class Page {
       byParent.set(node.parentId, siblings);
     }
     const lines: string[] = [];
-    const visited = new Set<string>();
     const visit = (node: (typeof nodes)[number], depth: number) => {
-      if (visited.has(node.nodeId)) return;
-      visited.add(node.nodeId);
       const role = node.role?.value ?? "";
       const name = node.name?.value ?? "";
       const value = node.value?.value;
@@ -532,10 +309,8 @@ export class Page {
       }
       for (const child of byParent.get(node.nodeId) ?? []) visit(child, depth + 1);
     };
-    for (const root of nodes.filter((node) => !node.parentId || !nodes.some((candidate) => candidate.nodeId === node.parentId))) {
-      visit(root, 0);
-    }
-    for (const node of nodes) visit(node, 0);
+    const ids = new Set(nodes.map((node) => node.nodeId));
+    for (const node of nodes) if (!node.parentId || !ids.has(node.parentId)) visit(node, 0);
     return lines.join("\n");
   }
 
@@ -544,44 +319,150 @@ export class Page {
   }
 }
 
-export class Locator {
-  readonly #page: Page;
-  readonly #query: string;
-  readonly selector: string;
+/** Retries `check` until it returns true. Errors count as false, since navigations briefly destroy the page's context. */
+async function poll(check: () => Promise<boolean>, timeoutMs: number, waitingFor: string): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown;
+  while (true) {
+    try {
+      if (await check()) return;
+    } catch (error) {
+      lastError = error;
+    }
+    if (Date.now() >= deadline) {
+      const reason = lastError instanceof Error ? ` (last error: ${lastError.message})` : "";
+      throw new Error(`Timed out after ${timeoutMs} ms waiting for ${waitingFor}${reason}`);
+    }
+    await sleep(100);
+  }
+}
 
-  constructor(page: Page, selector: string, query?: string) {
+/** A reference to an object in the page, which stays alive until its object group is released. */
+type Handle = string;
+
+type RemoteResult = {
+  result: { objectId?: string; value?: unknown };
+  exceptionDetails?: { text?: string; exception?: { description?: string } };
+};
+
+function unwrap({ result, exceptionDetails }: RemoteResult): RemoteResult["result"] {
+  if (exceptionDetails) throw new Error(exceptionDetails.exception?.description ?? exceptionDetails.text ?? "Browser evaluation failed");
+  return result;
+}
+
+async function evaluateHandle(page: Page, expression: string, group: string): Promise<Handle> {
+  return unwrap(await page.send<RemoteResult>("Runtime.evaluate", { expression, objectGroup: group })).objectId!;
+}
+
+/** Calls the function `fn` in the page, with `this` bound to `target` and JSON `args`. */
+async function callFunction(page: Page, target: Handle, fn: string, args: unknown[], options: { objectGroup: string } | { returnByValue: true }) {
+  return unwrap(await page.send<RemoteResult>("Runtime.callFunctionOn", {
+    objectId: target,
+    functionDeclaration: fn,
+    arguments: args.map((value) => ({ value })),
+    awaitPromise: true,
+    ...options,
+  }));
+}
+
+/**
+ * Finds elements with `role` under the roots through Chrome's accessibility tree, so roles and names are the ones Chrome
+ * computes. It reads the whole tree because Accessibility.queryAXTree never answers in background tabs.
+ */
+async function resolveRole(page: Page, roots: Handle, role: string, options: RoleLocatorOptions, group: string): Promise<Handle> {
+  const { nodes } = await page.send<{
+    nodes: Array<{ ignored?: boolean; role?: { value?: unknown }; name?: { value?: unknown }; backendDOMNodeId?: number }>;
+  }>("Accessibility.getFullAXTree");
+
+  const backendNodeIds = new Set<number>();
+  for (const node of nodes) {
+    // Ignored nodes are hidden from assistive technology, for example with aria-hidden.
+    if (node.ignored || node.role?.value !== role || node.backendDOMNodeId === undefined) continue;
+    if (options.name === undefined || nameMatches(String(node.name?.value ?? ""), options.name, options.exact ?? false)) {
+      backendNodeIds.add(node.backendDOMNodeId);
+    }
+  }
+
+  const elements = await Promise.all([...backendNodeIds].map(async (backendNodeId) => {
+    const { object } = await page.send<{ object: { objectId: string } }>("DOM.resolveNode", { backendNodeId, objectGroup: group });
+    return object.objectId;
+  }));
+  return unwrap(await page.send<RemoteResult>("Runtime.callFunctionOn", {
+    objectId: roots,
+    // The accessibility tree's order can differ from the document's, for example for an open <dialog>.
+    functionDeclaration: `function (...elements) {
+      return elements
+        .filter((el) => this.some((root) => root.contains(el)))
+        .sort((a, b) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1));
+    }`,
+    arguments: elements.map((objectId) => ({ objectId })),
+    objectGroup: group,
+  })).objectId!;
+}
+
+/** Chrome has already collapsed whitespace in accessible names. */
+function nameMatches(name: string, expected: string | RegExp, exact: boolean): boolean {
+  if (expected instanceof RegExp) return new RegExp(expected.source, expected.flags.replace(/[gy]/g, "")).test(name);
+  return exact ? name === expected : name.includes(expected);
+}
+
+// In-page helpers, spliced into the functions that locators call.
+const IS_VISIBLE = `const isVisible = (el) => { const rect = el.getBoundingClientRect(); return el.checkVisibility({ visibilityProperty: true }) && rect.width > 0 && rect.height > 0; };`;
+const MATCHES = `const matches = (el, spec) => {
+  const value = (el.innerText ?? el.textContent ?? "").replace(/\\s+/g, " ").trim();
+  return spec.source !== undefined ? new RegExp(spec.source, spec.flags).test(value) : spec.exact ? value === spec.text : value.includes(spec.text);
+};`;
+
+/** The innermost elements whose text matches, so a match is the text itself rather than every ancestor of it. */
+const GET_BY_TEXT = `function (spec) {
+  ${MATCHES}
+  const skip = new Set(["HEAD", "TITLE", "SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE"]);
+  const hits = new Set(this.flatMap((root) => Array.from(root.querySelectorAll("*"))).filter((el) => !skip.has(el.tagName) && matches(el, spec)));
+  return [...hits].filter((el) => !Array.from(el.children).some((child) => hits.has(child)));
+}`;
+
+const FILTER = `function (spec, visible) {
+  ${MATCHES}
+  ${IS_VISIBLE}
+  return this.filter((el) => (spec === null || matches(el, spec)) && (visible === null || isVisible(el) === visible));
+}`;
+
+type TextSpec = { text: string; exact: boolean } | { source: string; flags: string };
+
+function textSpec(expected: string | RegExp, exact: boolean): TextSpec {
+  return expected instanceof RegExp ? { source: expected.source, flags: expected.flags.replace(/[gy]/g, "") } : { text: expected, exact };
+}
+
+/** Resolves, in the given object group, to a handle on an in-page array of the matching elements. */
+type Resolve = (group: string) => Promise<Handle>;
+
+export class Locator {
+  /** Describes the locator in error messages. */
+  readonly selector: string;
+  readonly #page: Page;
+  readonly #resolve: Resolve;
+
+  constructor(page: Page, selector: string, resolve: Resolve) {
     this.#page = page;
     this.selector = selector;
-    this.#query = query ?? `Array.from(document.querySelectorAll(${JSON.stringify(selector)}))`;
+    this.#resolve = resolve;
   }
 
-  static byRole(page: Page, role: string, options: RoleLocatorOptions = {}, roots?: string): Locator {
-    const query = Locator.#roleQuery(role, options, roots ?? "[document]");
-    return new Locator(page, `role=${role}`, query);
+  locator(selector: string): Locator {
+    return this.#then(selector, `function (selector) { return this.flatMap((root) => Array.from(root.querySelectorAll(selector))); }`, [selector]);
   }
 
-  static byText(page: Page, text: string | RegExp, options: TextLocatorOptions = {}, roots?: string): Locator {
-    const match = Locator.#textMatch("value", text, options.exact ?? false);
-    const query = `(() => {
-      const roots = ${roots ?? "[document]"};
-      const candidates = roots.flatMap((root) => Array.from(root.querySelectorAll("*")));
-      return candidates.filter((el) => { const value = (el.innerText ?? el.textContent ?? "").trim(); return ${match}; });
-    })()`;
-    return new Locator(page, `text=${String(text)}`, query);
+  getByText(text: string | RegExp, options: TextLocatorOptions = {}): Locator {
+    return this.#then(`text=${text}`, GET_BY_TEXT, [textSpec(text, options.exact ?? false)]);
+  }
+
+  getByRole(role: string, options: RoleLocatorOptions = {}): Locator {
+    return new Locator(this.#page, this.#describe(`role=${role}`), async (group) => resolveRole(this.#page, await this.#resolve(group), role, options, group));
   }
 
   filter(options: LocatorFilterOptions): Locator {
-    const checks: string[] = [];
-    if (options.hasText !== undefined) {
-      checks.push(Locator.#textMatch("(el.innerText ?? el.textContent ?? \"\")", options.hasText, false));
-    }
-    if (options.visible !== undefined) checks.push(`isVisible(el) === ${options.visible}`);
-    if (checks.length === 0) return new Locator(this.#page, this.selector, this.#query);
-    const query = `(() => {
-      const isVisible = (el) => { const style = getComputedStyle(el); const rect = el.getBoundingClientRect(); return style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0; };
-      return (${this.#query}).filter((el) => ${checks.join(" && ")});
-    })()`;
-    return new Locator(this.#page, this.selector, query);
+    const spec = options.hasText === undefined ? null : textSpec(options.hasText, false);
+    return this.#then("", FILTER, [spec, options.visible ?? null]);
   }
 
   first(): Locator {
@@ -589,159 +470,107 @@ export class Locator {
   }
 
   last(): Locator {
-    return new Locator(this.#page, this.selector, `(${this.#query}).slice(-1)`);
+    return this.nth(-1);
   }
 
+  /** Negative indexes count from the end. */
   nth(index: number): Locator {
     if (!Number.isInteger(index)) throw new Error("Locator index must be an integer");
-    const query = index >= 0
-      ? `(${this.#query}).slice(${index}, ${index + 1})`
-      : `(${this.#query}).slice(${index}).slice(0, 1)`;
-    return new Locator(this.#page, this.selector, query);
-  }
-
-  getByRole(role: string, options: RoleLocatorOptions = {}): Locator {
-    return Locator.byRole(this.#page, role, options, this.#query);
-  }
-
-  getByText(text: string | RegExp, options: TextLocatorOptions = {}): Locator {
-    return Locator.byText(this.#page, text, options, this.#query);
+    return this.#then(`nth=${index}`, `function (index) { const el = this.at(index); return el ? [el] : []; }`, [index]);
   }
 
   count(): Promise<number> {
-    return this.#page.evaluate<number>(`(${this.#query}).length`);
+    return this.#evaluate("function () { return this.length; }");
   }
 
   allTextContents(): Promise<string[]> {
-    return this.#page.evaluate<string[]>(`(${this.#query}).map((el) => el.textContent ?? "")`);
+    return this.#evaluate(`function () { return this.map((el) => el.textContent ?? ""); }`);
   }
 
   text(): Promise<string> {
-    return this.#page.evaluate<string>(this.#withElement("return el.textContent ?? \"\";"));
+    return this.#evaluateFirst(`return el.textContent ?? "";`);
   }
 
   getAttribute(name: string): Promise<string | null> {
-    return this.#page.evaluate<string | null>(this.#withElement(`return el.getAttribute(${JSON.stringify(name)});`));
+    return this.#evaluateFirst("return el.getAttribute(arg);", name);
   }
 
   isVisible(): Promise<boolean> {
-    return this.#page.evaluate<boolean>(this.#withElement(
-      `const style = getComputedStyle(el); const rect = el.getBoundingClientRect(); return style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;`,
-    ));
+    return this.#evaluate(`function () { ${IS_VISIBLE} return !!this[0] && isVisible(this[0]); }`);
   }
 
-  async waitFor(options: WaitForLocatorOptions = {}): Promise<void> {
-    const state = options.state ?? "visible";
-    const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT;
-    await this.#page.evaluate(
-      `new Promise((resolve, reject) => {
-        const deadline = Date.now() + ${timeoutMs};
-        const check = () => {
-          const el = (${this.#query})[0];
-          const visible = !!el && (() => { const style = getComputedStyle(el); const rect = el.getBoundingClientRect(); return style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0; })();
-          if ((${JSON.stringify(state)} === "attached" && el) || (${JSON.stringify(state)} === "detached" && !el) || (${JSON.stringify(state)} === "visible" && visible) || (${JSON.stringify(state)} === "hidden" && !visible)) return resolve();
-          if (Date.now() >= deadline) return reject(new Error("Timed out waiting for locator to be ${state}"));
-          setTimeout(check, 50);
-        };
-        check();
-      })`,
-    );
+  async waitFor({ state = "visible", timeoutMs = DEFAULT_TIMEOUT }: WaitForLocatorOptions = {}): Promise<void> {
+    const check = `function (state) {
+      ${IS_VISIBLE}
+      const el = this[0];
+      const visible = !!el && isVisible(el);
+      return { attached: !!el, detached: !el, visible, hidden: !visible }[state];
+    }`;
+    await poll(() => this.#evaluate<boolean>(check, [state]), timeoutMs, `${this.selector} to be ${state}`);
   }
 
+  /** Waits for the first match to be visible, scrolls it into view, and clicks its center with real mouse events. */
   async click(): Promise<void> {
-    const rect = await this.#page.evaluate<{ x: number; y: number }>(this.#withElement(
-      `el.scrollIntoView({block:"center", inline:"center"}); const r = el.getBoundingClientRect(); return {x:r.left+r.width/2, y:r.top+r.height/2};`,
-    ));
-    const base = { x: rect.x, y: rect.y, button: "left", clickCount: 1 };
+    await this.waitFor({ timeoutMs: ACTION_TIMEOUT });
+    const { x, y } = await this.#evaluateFirst<{ x: number; y: number }>(
+      `el.scrollIntoView({ block: "center", inline: "center" }); const r = el.getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height / 2 };`,
+    );
+    const base = { x, y, button: "left", clickCount: 1 };
     await this.#page.send("Input.dispatchMouseEvent", { ...base, type: "mouseMoved" });
     await this.#page.send("Input.dispatchMouseEvent", { ...base, type: "mousePressed" });
     await this.#page.send("Input.dispatchMouseEvent", { ...base, type: "mouseReleased" });
   }
 
+  /** Waits for the first match to be visible, clears it, and types `value`. */
   async fill(value: string): Promise<void> {
-    await this.#page.evaluate(this.#withElement(
-      `el.focus(); if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) { el.value = ""; el.dispatchEvent(new Event("input", {bubbles:true})); } else if (el instanceof HTMLElement && el.isContentEditable) { el.textContent = ""; } else { throw new Error("Element is not editable"); }`,
-    ));
+    await this.waitFor({ timeoutMs: ACTION_TIMEOUT });
+    await this.#evaluateFirst(
+      `el.focus(); if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) { el.value = ""; el.dispatchEvent(new Event("input", { bubbles: true })); } else if (el.isContentEditable) { el.textContent = ""; } else { throw new Error("Element is not editable"); }`,
+    );
     await this.#page.send("Input.insertText", { text: value });
   }
 
-  #withElement(body: string): string {
-    return `(() => { const el = (${this.#query})[0]; if (!el) throw new Error(${JSON.stringify(`Element not found: ${this.selector}`)}); ${body} })()`;
+  #describe(step: string): string {
+    return [this.selector, step].filter(Boolean).join(" >> ");
   }
 
-  static #textMatch(valueExpression: string, expected: string | RegExp, exact: boolean): string {
-    if (expected instanceof RegExp) {
-      const flags = expected.flags.replace(/[gy]/g, "");
-      return `new RegExp(${JSON.stringify(expected.source)}, ${JSON.stringify(flags)}).test(${valueExpression})`;
+  /** A locator for the elements that the in-page function `fn` returns, called on this locator's matches. */
+  #then(step: string, fn: string, args: unknown[]): Locator {
+    return new Locator(this.#page, this.#describe(step), async (group) => {
+      return (await callFunction(this.#page, await this.#resolve(group), fn, args, { objectGroup: group })).objectId!;
+    });
+  }
+
+  /** Resolves the matches in a fresh object group, returns what `fn` returns for them, and releases the group. */
+  async #evaluate<T>(fn: string, args: unknown[] = []): Promise<T> {
+    const group = randomUUID();
+    try {
+      return (await callFunction(this.#page, await this.#resolve(group), fn, args, { returnByValue: true })).value as T;
+    } finally {
+      this.#page.send("Runtime.releaseObjectGroup", { objectGroup: group }).catch(() => {});
     }
-    return exact
-      ? `${valueExpression}.trim() === ${JSON.stringify(expected)}`
-      : `${valueExpression}.includes(${JSON.stringify(expected)})`;
   }
 
-  static #roleQuery(role: string, options: RoleLocatorOptions, roots: string): string {
-    const nameMatch = options.name === undefined
-      ? "true"
-      : Locator.#textMatch("accessibleName(el)", options.name, options.exact ?? false);
-    return `(() => {
-      const roots = ${roots};
-      const implicitRole = (el) => {
-        const tag = el.tagName.toLowerCase();
-        if (tag === "button") return "button";
-        if (tag === "a" && el.hasAttribute("href")) return "link";
-        if (tag === "textarea") return "textbox";
-        if (tag === "select") return el.multiple ? "listbox" : "combobox";
-        if (/^h[1-6]$/.test(tag)) return "heading";
-        if (tag === "img") return "img";
-        if (tag === "nav") return "navigation";
-        if (tag === "main") return "main";
-        if (tag === "ul" || tag === "ol") return "list";
-        if (tag === "li") return "listitem";
-        if (tag === "table") return "table";
-        if (tag === "tr") return "row";
-        if (tag === "td") return "cell";
-        if (tag === "th") return "columnheader";
-        if (tag === "input") {
-          const type = (el.getAttribute("type") ?? "text").toLowerCase();
-          if (["button", "submit", "reset", "image"].includes(type)) return "button";
-          if (type === "checkbox") return "checkbox";
-          if (type === "radio") return "radio";
-          if (["text", "email", "search", "tel", "url", "password"].includes(type)) return "textbox";
-        }
-        return "";
-      };
-      const accessibleName = (el) => {
-        const labelledBy = el.getAttribute("aria-labelledby");
-        if (labelledBy) return labelledBy.split(/\\s+/).map((id) => document.getElementById(id)?.textContent ?? "").join(" ").trim();
-        const explicitLabel = el.id ? document.querySelector('label[for="' + CSS.escape(el.id) + '"]') : null;
-        const wrappingLabel = el.closest("label");
-        return (el.getAttribute("aria-label") ?? explicitLabel?.textContent ?? wrappingLabel?.textContent ?? el.getAttribute("alt") ?? el.getAttribute("title") ?? (el instanceof HTMLInputElement ? el.value : undefined) ?? el.innerText ?? el.textContent ?? "").trim();
-      };
-      const candidates = roots.flatMap((root) => Array.from(root.querySelectorAll("*")));
-      return candidates.filter((el) => (el.getAttribute("role") ?? implicitRole(el)) === ${JSON.stringify(role)} && ${nameMatch});
-    })()`;
+  /** Runs `body` with `el` bound to the first match, and `arg` to `arg`. */
+  #evaluateFirst<T>(body: string, arg?: unknown): Promise<T> {
+    const notFound = JSON.stringify(`Element not found: ${this.selector}`);
+    return this.#evaluate(`function (arg) { const el = this[0]; if (!el) throw new Error(${notFound}); ${body} }`, [arg]);
   }
 }
 
 /** Connects through the local daemon, starting it if needed. Call `close()` when done, or the process stays alive. */
 export async function connectBrowser(options: ConnectBrowserOptions = {}): Promise<Browser> {
-  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT;
-  if (options.cdpUrl) {
-    const connection = new CdpConnection(await resolveCdpWebSocketUrl(options.cdpUrl), "cdp", timeoutMs);
-    await connection.connect();
-    return new Browser(connection);
-  }
-  const browser = options.browser ?? "isolated";
-  const { port, token } = await ensureDaemon();
-  const connection = new CdpConnection(`ws://127.0.0.1:${port}`, browser === "user" ? "extension" : "cdp", timeoutMs, {
-    type: "hello",
-    role: "sdk",
-    token,
-    protocolVersion: 1,
-    browser,
-    session: process.env.BROWSER_USE_SESSION || undefined,
+  const token = await ensureDaemon();
+  const ws = new WebSocket(DAEMON_URL);
+  await new Promise<void>((resolve, reject) => {
+    const hello = { type: "hello", role: "sdk", token, browser: options.browser ?? "isolated", session: process.env.BROWSER_USE_SESSION || undefined };
+    ws.addEventListener("open", () => ws.send(JSON.stringify(hello)), { once: true });
+    ws.addEventListener("message", (event) => {
+      const reply = JSON.parse(String(event.data));
+      if (reply.ok) resolve();
+      else reject(new Error(reply.error ?? "The browser daemon rejected the connection"));
+    }, { once: true });
+    ws.addEventListener("close", () => reject(new Error("Could not connect to the browser daemon")), { once: true });
   });
-  await connection.connect();
-  await connection.waitForExtension(Math.min(timeoutMs, 5_000));
-  return new Browser(connection);
+  return new Browser(new CdpConnection(ws, options.timeoutMs ?? DEFAULT_TIMEOUT));
 }
